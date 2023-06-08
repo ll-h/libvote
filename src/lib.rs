@@ -1,6 +1,13 @@
+mod cand_pair;
+
 use std::iter::{Take, Skip};
 use std::borrow::Borrow;
 use std::ops::AddAssign;
+use crate::cand_pair::CandidatePair;
+mod cand_idx;
+use cand_idx::*;
+mod immut;
+use immut::Immutable;
 
 use thiserror::Error;
 
@@ -27,31 +34,6 @@ pub trait BallotBox {
     fn add_ballot<B: Ballot + Borrow<[usize]>>(&mut self, ballot: &B) -> Result<Self::Proof, BallotError>;
 }
 
-#[derive(Clone)]
-pub struct CandidateIndex(usize);
-
-pub trait HasCandidates {
-    fn nb_candidates(&self) -> usize;
-}
-
-pub trait CandidateValidator : HasCandidates {
-    fn validate_candidate_index(&self, unchecked_candidate_idx: usize)
-        -> Result<CandidateIndex, BallotError>;
-}
-
-impl<T: HasCandidates> CandidateValidator for T {
-    fn validate_candidate_index(&self, unchecked_candidate_idx: usize)
-        -> Result<CandidateIndex, BallotError>
-    {
-        if self.nb_candidates() > unchecked_candidate_idx {
-            Ok(CandidateIndex(unchecked_candidate_idx))
-        }
-        else {
-            Err(BallotError::InvalidCandidate(unchecked_candidate_idx))
-        }
-    }
-}
-
 pub trait BallotValidator : HasCandidates {
     fn validate_ballot_size(&self, unchecked_ballot: &[usize])
         -> Result<(), BallotError>;
@@ -71,6 +53,62 @@ impl<T: HasCandidates> BallotValidator for T where
     }
 }
 
+pub struct DefaultPairsIterator<'a, M: PreferenceMatrix> {
+    candidate: usize,
+    opponent: usize,
+    cand_lim: Immutable<usize>,
+    oppo_lim: Immutable<usize>,
+    matrix: &'a M
+}
+
+impl<'a, M: PreferenceMatrix> DefaultPairsIterator<'a, M> {
+    fn new(matrix: &'a M) -> Self {
+        let oppo_lim = Immutable::new(matrix.nb_candidates());
+        if oppo_lim.get() < &2 {
+            panic!("Invalid number of candidates.");
+        }
+        DefaultPairsIterator {
+            candidate: 0,
+            opponent: 1,
+            cand_lim: Immutable::new(matrix.nb_candidates()-1),
+            oppo_lim,
+            matrix
+        }
+    }
+}
+
+impl<M> Iterator for DefaultPairsIterator<'_, M>
+where
+    M: PreferenceMatrix,
+    M::OpponentCounter : Clone + PartialOrd
+{
+    type Item = CandidatePair<M::OpponentCounter>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // With generators this would have been a lot easier : two for loops and a yield
+        if &self.opponent >= self.oppo_lim.get() {
+            self.candidate += 1;
+            self.opponent = self.candidate + 1;
+        }
+        if &self.candidate >= self.cand_lim.get() {
+            return None
+        }
+
+        // by construction of Self and the above conditions, the values that will got there are valid candidate indexes
+        let (candidate, opponent) = unsafe {(
+            CandidateIndex::new(self.candidate),
+            CandidateIndex::new(self.opponent),
+        )};
+
+        Some(CandidatePair::new(
+            candidate.clone(),
+            opponent.clone(),
+            self.matrix.times_left_is_preferred_over_right(&candidate, &opponent).clone(),
+            self.matrix.times_left_is_preferred_over_right(&opponent, &candidate).clone(),
+        ))
+    }
+}
+
 pub trait PreferenceMatrix : CandidateValidator {
     type OpponentCounter;
     type OpponentCounterIter<'a> : Iterator<Item = &'a mut Self::OpponentCounter> where Self::OpponentCounter: 'a, Self: 'a;
@@ -80,6 +118,24 @@ pub trait PreferenceMatrix : CandidateValidator {
         -> Self::OpponentCounterIter<'a>;
 
     fn times_left_is_preferred_over_right(&self, left: &CandidateIndex, right: &CandidateIndex) -> &Self::OpponentCounter;
+
+    fn pairs(&self) -> DefaultPairsIterator<'_, Self> where Self: Sized {
+        DefaultPairsIterator::new(&self)
+    }
+
+    /* with feature(return_position_impl_trait_in_trait)
+    fn pairs<'a>(&'a self) -> impl Iterator<Item = CandidatePair<Self::OpponentCounter>> + 'a {
+        (0..self.nb_candidates)
+            .map(|c| (c..self.nb_candidates+1).into_iter().map(move |o| (CandidateIndex(c), CandidateIndex(o))))
+            .flatten()
+            .map(|(c, o)| CandidatePair::<N>{
+                winner: c.clone(),
+                opponent: o.clone(),
+                winners_votes: self.times_left_is_preferred_over_right(&c, &o).clone(),
+                opponents_votes: self.times_left_is_preferred_over_right(&o, &c).clone(),
+        })
+    }
+    */
 }
 
 /// This type is meant to test the genericity of the trait PreferenceMatrix.
@@ -124,15 +180,20 @@ impl<N> PreferenceMatrix for SimpleAccumulatingBallotBox<N> {
     fn get_opponents_vote_counter_iter<'a>(&'a mut self, candidate_idx: CandidateIndex)
         -> Self::OpponentCounterIter<'a>
     {
-        let usize_cidx: usize = candidate_idx.0.into();
+        let usize_cidx: usize = candidate_idx.into();
         unsafe {
             self.0.get_unchecked_mut(usize_cidx).iter_mut()
         }
     }
 
     fn times_left_is_preferred_over_right(&self, left: &CandidateIndex, right: &CandidateIndex) -> &Self::OpponentCounter {
-        unsafe {
-            self.0.get_unchecked(left.0).get_unchecked(right.0).clone()
+        let left: usize = left.clone().into();
+        let right: usize = right.clone().into();
+        unsafe { // precondition enforced by the type CandidateIndex of left and right
+            self.0
+                .get_unchecked(left)
+                .get_unchecked(right)
+                .clone()
         }
     }
 }
@@ -155,21 +216,24 @@ impl<N> ContiguousAccumulatingBallotBox<N> {
     }
 }
 
-impl<N> PreferenceMatrix for ContiguousAccumulatingBallotBox<N> {
+impl<N: Clone> PreferenceMatrix for ContiguousAccumulatingBallotBox<N> {
     type OpponentCounter = N;
     type OpponentCounterIter<'a> = Take<Skip<core::slice::IterMut<'a, Self::OpponentCounter>>> where Self::OpponentCounter: 'a;
+
     fn get_opponents_vote_counter_iter<'a>(&'a mut self, candidate_idx: CandidateIndex)
         -> Self::OpponentCounterIter<'a>
     {
         self.counts
             .iter_mut()
-            .skip(self.nb_candidates * candidate_idx.0)
+            .skip(self.nb_candidates * usize::from(candidate_idx))
             .take(self.nb_candidates)
     }
 
     fn times_left_is_preferred_over_right(&self, left: &CandidateIndex, right: &CandidateIndex) -> &Self::OpponentCounter {
+        let left: usize = left.clone().into();
+        let right: usize = right.clone().into();
         unsafe {
-            self.counts.get_unchecked(left.0 * self.nb_candidates + right.0)
+            self.counts.get_unchecked(left * self.nb_candidates + right)
         }
     }
 }
@@ -191,11 +255,14 @@ impl<T> BallotBox for T where
         // checking that candidates are there only once
         let mut usage = [false].repeat(self.nb_candidates()); // (*)
         for candidate in ballot.borrow() {
-            let candidate_idx = self.validate_candidate_index(candidate.clone())?; // (**)
+            let candidate = candidate.clone().into();
+            let candidate_idx = self
+                .validate_candidate_index(candidate) // (**)
+                .map_err(|()| BallotError::InvalidCandidate(candidate))?;
             unsafe {
-                let already_used = usage.get_unchecked_mut(candidate_idx.clone().0); // made safe by (*) and (**)
+                let already_used = usage.get_unchecked_mut(candidate); // made safe by (*) and (**)
                 if *already_used {
-                    return Err(BallotError::CandidateAppearedTooMuch(candidate.clone()));
+                    return Err(BallotError::CandidateAppearedTooMuch(candidate));
                 }
                 else {
                     *already_used = true;
